@@ -1,31 +1,31 @@
 /**
- * NCAA Sport-Agnostic Ticker Proxy (ESPN)
- * - /scores : ESPN scoreboard -> compact JSON, includes home_id/away_id
- * - /logo   : returns 16x16 BMP via external converter backend
- * - /logo32 : returns 32x32 BMP via external converter backend
+ * NCAA Proxy for ESP32 Tickers (Football + Basketball + Baseball)
+ * - /scores returns compact JSON including home_id/away_id
+ * - /logo and /logo32 proxy to Vercel BMP backend and cache at Cloudflare edge
  *
- * Hosted example:
- *   https://ncaa-ticker-proxy.g-mortuza.workers.dev/scores?preset=ncaam&tz=-4
+ * Example:
+ *  /scores?preset=ncaam&tz=-4
+ *  /scores?preset=cfb&tz=-4
+ *  /scores?preset=cbase&tz=-4
  *
- * Query params:
- *   /scores?preset=cfb|ncaam|ncaaw|cbase
- *   /scores?sport=football&league=college-football&dates=YYYYMMDD&team=DUKE&tz=-4
+ *  /logo?teamId=150
+ *  /logo32?teamId=150
  *
- * Logo:
- *   /logo?teamId=150
- *   /logo32?teamId=150
- *
- * IMPORTANT:
- * Cloudflare Workers cannot natively decode PNG -> BMP without extra libraries/WASM.
- * So /logo and /logo32 forward to a BMP conversion backend you control.
- *
- * Configure in Worker env vars:
- *   LOGO_BMP_BACKEND_BASE = "https://your-bmp-service.example.com"
- * Backend contract (recommended):
- *   GET {LOGO_BMP_BACKEND_BASE}/espn/ncaa/logo?teamId=150&size=16   -> image/bmp
- *   GET {LOGO_BMP_BACKEND_BASE}/espn/ncaa/logo?teamId=150&size=32   -> image/bmp
+ * Cloudflare caching uses fetch cf options cacheEverything/cacheTtl. [1](https://developers.cloudflare.com/workers/examples/cache-using-fetch/)
  */
 
+// ----------------------
+// CONFIG
+// ----------------------
+
+// Hardcode your working Vercel BMP backend:
+const DEFAULT_VERCEL_BASE = "https://ncaa-proxy.vercel.app";
+
+// Cache settings
+const LOGO_CACHE_TTL_SEC = 7 * 24 * 60 * 60;  // 7 days
+const SCORE_SUBFETCH_TTL_SEC = 15;            // 15s edge cache for ESPN scoreboard fetch
+
+// NCAA presets -> ESPN {sport}/{league}
 const NCAA_PRESETS = {
   cfb:   { sport: "football",   league: "college-football" },
   ncaam: { sport: "basketball", league: "mens-college-basketball" },
@@ -33,9 +33,37 @@ const NCAA_PRESETS = {
   cbase: { sport: "baseball",   league: "college-baseball" }
 };
 
+// ----------------------
+// HELPERS
+// ----------------------
+
+function getVercelBase(env) {
+  // Optional env override (nice if you have multiple backends)
+  return (env && env.NCAA_VERCEL_BASE) ? env.NCAA_VERCEL_BASE : DEFAULT_VERCEL_BASE;
+}
+
 function intOr(val, fallback) {
   const n = parseInt(val, 10);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function pickSportLeague(url) {
+  const preset = url.searchParams.get("preset")?.toLowerCase();
+  let sport = url.searchParams.get("sport");
+  let league = url.searchParams.get("league");
+
+  if (preset && NCAA_PRESETS[preset]) {
+    sport = NCAA_PRESETS[preset].sport;
+    league = NCAA_PRESETS[preset].league;
+  }
+
+  // Default if nothing provided
+  if (!sport || !league) {
+    sport = "basketball";
+    league = "mens-college-basketball";
+  }
+
+  return { sport, league };
 }
 
 function buildScoreboardUrl(sport, league, dates) {
@@ -59,48 +87,27 @@ function formatPreGameTime(isoDateStr, tzOffsetHours) {
   return `${month}/${day} - ${hours}:${minutes} ${ampm}`;
 }
 
-function pickTeamAndLeague(url) {
-  const preset = url.searchParams.get("preset")?.toLowerCase();
-  let sport = url.searchParams.get("sport");
-  let league = url.searchParams.get("league");
-
-  if (preset && NCAA_PRESETS[preset]) {
-    sport = NCAA_PRESETS[preset].sport;
-    league = NCAA_PRESETS[preset].league;
-  }
-
-  // Default to NCAA baseball if omitted (safe default; adjust if you want)
-  if (!sport || !league) {
-    sport = "baseball";
-    league = "college-baseball";
-  }
-
-  return { sport, league };
+function withCors(res, cacheControl) {
+  const out = new Response(res.body, res);
+  out.headers.set("Access-Control-Allow-Origin", "*");
+  if (cacheControl) out.headers.set("Cache-Control", cacheControl);
+  return out;
 }
 
-/**
- * Optional: Resolve teamId from abbreviation if caller provides team=DUKE
- * ESPN supports team info routes under each league.
- * NOTE: This adds an extra call; best practice is to use home_id/away_id from /scores.
- */
-async function resolveTeamIdFromAbbr(sport, league, abbr) {
-  if (!abbr) return "";
-  const t = abbr.toLowerCase();
-  const url = `https://site.api.espn.com/apis/site/v2/sports/${sport}/${league}/teams/${encodeURIComponent(t)}`;
-  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!res.ok) return "";
-  const data = await res.json();
-  const id = data?.team?.id || data?.id || "";
-  return id ? String(id) : "";
+function json(obj, status = 200, cacheControl = null) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      ...(cacheControl ? { "Cache-Control": cacheControl } : {})
+    }
+  });
 }
 
-/**
- * ESPN NCAA team logo (PNG) pattern.
- * Example visible on ESPN pages: https://a.espncdn.com/i/teamlogos/ncaa/500/2612.png [1](https://www.espn.com.sg/mens-college-basketball/)
- */
-function espnNcaaPngUrl(teamId, size = 500) {
-  return `https://a.espncdn.com/i/teamlogos/ncaa/${size}/${teamId}.png`;
-}
+// ----------------------
+// WORKER
+// ----------------------
 
 export default {
   async fetch(request, env, ctx) {
@@ -111,29 +118,32 @@ export default {
     }
 
     if (url.pathname === "/logo" || url.pathname === "/logo32") {
-      return handleLogo(url, env, url.pathname === "/logo32" ? 32 : 16);
+      const size = (url.pathname === "/logo32") ? 32 : 16;
+      return handleLogo(url, env, size);
     }
 
-    return new Response(
-      "NCAA ESPN Ticker Proxy Online. Try /scores?preset=ncaam or /scores?preset=cfb",
-      { status: 200 }
-    );
+    return new Response("NCAA Cloudflare Worker Online", { status: 200 });
   }
 };
 
+// ----------------------
+// /scores
+// ----------------------
+
 async function handleScores(url) {
-  const { sport, league } = pickTeamAndLeague(url);
+  const { sport, league } = pickSportLeague(url);
 
   const tzOffset = intOr(url.searchParams.get("tz"), -5);
-  const dates = url.searchParams.get("dates"); // YYYYMMDD (optional)
-  const teamFilter = url.searchParams.get("team")?.toUpperCase();
+  const dates = url.searchParams.get("dates"); // optional YYYYMMDD
+  const teamFilter = url.searchParams.get("team")?.toUpperCase(); // optional
 
   const espnUrl = buildScoreboardUrl(sport, league, dates);
 
   try {
+    // Cache ESPN subrequest briefly at edge to reduce repeated hits. [1](https://developers.cloudflare.com/workers/examples/cache-using-fetch/)
     const res = await fetch(espnUrl, {
       headers: { "User-Agent": "Mozilla/5.0" },
-      cf: { cacheTtl: 15 }
+      cf: { cacheEverything: true, cacheTtl: SCORE_SUBFETCH_TTL_SEC }
     });
 
     if (!res.ok) {
@@ -148,16 +158,15 @@ async function handleScores(url) {
     const games = (data.events || []).map((event) => {
       const competition = event?.competitions?.[0];
       const status = competition?.status ?? event?.status ?? {};
-      const statusState = status?.type?.state || "pre"; // pre | in | post
+      const state = status?.type?.state || "pre"; // pre | in | post
 
-      if (statusState === "in") anyActive = true;
-      else if (statusState === "pre") anyUpcoming = true;
+      if (state === "in") anyActive = true;
+      else if (state === "pre") anyUpcoming = true;
 
-      let displayClock = status?.type?.detail || "";
+      let clock = status?.type?.detail || "";
 
-      // pre-game: show scheduled time derived from event.date
-      if (statusState === "pre") {
-        displayClock = formatPreGameTime(event?.date, tzOffset);
+      if (state === "pre") {
+        clock = formatPreGameTime(event?.date, tzOffset);
       }
 
       const homeRaw = competition?.competitors?.find((c) => c.homeAway === "home");
@@ -173,92 +182,54 @@ async function handleScores(url) {
         away_id: awayTeam.id ? String(awayTeam.id) : "",
         home_score: homeRaw?.score || "0",
         away_score: awayRaw?.score || "0",
-        clock: displayClock,
-        status: statusState,
-        // helpful for debugging and/or for ESP32 to know which sport it is
-        sport,
-        league
+        clock,
+        status: state
       };
     });
 
-    // Filter by team abbreviation if requested (works only within the chosen sport/league)
-    let out = games;
+    // Filter by abbreviation if requested (scoped to chosen sport/league)
+    let responseData = games;
     if (teamFilter) {
-      const matches = games.filter((g) => g.home === teamFilter || g.away === teamFilter);
-      const inProgress = matches.find((g) => g.status === "in");
-      out = inProgress || matches[0] || { error: "Game Not Found", status: "No Game" };
+      const matches = games.filter(g => g.home === teamFilter || g.away === teamFilter);
+      const inProgress = matches.find(g => g.status === "in");
+      responseData = inProgress || matches[0] || { error: "Game Not Found", status: "No Game" };
     }
 
+    // Same smart polling behavior as your MLB worker
     let pollInterval = 10;
     let swr = 10;
-    if (!anyActive && anyUpcoming) {
-      pollInterval = 600;
-      swr = 60;
-    }
-    if (!anyActive && !anyUpcoming) {
-      pollInterval = 7200;
-      swr = 300;
-    }
+    if (!anyActive && anyUpcoming) { pollInterval = 600; swr = 60; }
+    if (!anyActive && !anyUpcoming) { pollInterval = 7200; swr = 300; }
 
-    return new Response(JSON.stringify(out), {
+    return new Response(JSON.stringify(responseData), {
       headers: {
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": "*",
         "Cache-Control": `public, s-maxage=${pollInterval}, stale-while-revalidate=${swr}`
       }
     });
+
   } catch (e) {
-    return json({ error: "ESPN Exception", message: String(e) }, 500);
+    return json({ error: "NCAA Fetch Failed", message: String(e) }, 500);
   }
 }
+
+// ----------------------
+// /logo and /logo32
+// ----------------------
 
 async function handleLogo(url, env, size) {
-  // Prefer teamId passed explicitly
-  let teamId = url.searchParams.get("teamId") || url.searchParams.get("id") || "";
+  const teamId = url.searchParams.get("teamId") || url.searchParams.get("id");
+  if (!teamId) return new Response("Missing teamId", { status: 400 });
 
-  // Optional support: if caller sends team=DUKE plus sport/league, resolve ID
-  if (!teamId) {
-    const teamAbbr = url.searchParams.get("team")?.toUpperCase() || "";
-    const { sport, league } = pickTeamAndLeague(url);
-    if (teamAbbr) {
-      teamId = await resolveTeamIdFromAbbr(sport, league, teamAbbr);
-    }
-  }
+  const vercelBase = getVercelBase(env).replace(/\/$/, "");
+  const vercelUrl = `${vercelBase}/api/logo?teamId=${encodeURIComponent(teamId)}&size=${size}`;
 
-  if (!teamId) {
-    return new Response("Missing teamId (or team+sport/league)", { status: 400 });
-  }
-
-  // If you have a BMP backend, forward to it (recommended for ESP32)
-  const backend = env.LOGO_BMP_BACKEND_BASE;
-  if (backend) {
-    const forwardUrl = `${backend.replace(/\/$/, "")}/espn/ncaa/logo?teamId=${encodeURIComponent(teamId)}&size=${size}`;
-    // Just proxy the BMP stream back
-    const res = await fetch(forwardUrl, { cf: { cacheTtl: 604800 } });
-    return new Response(res.body, {
-      status: res.status,
-      headers: {
-        "Content-Type": res.headers.get("Content-Type") || "image/bmp",
-        "Cache-Control": "public, s-maxage=604800",
-        "Access-Control-Allow-Origin": "*"
-      }
-    });
-  }
-
-  // Fallback: return the upstream PNG URL so you can validate mapping quickly in a browser
-  // NOTE: This won't work with your current ESP32 BMP pipeline — intended for testing only.
-  const png = espnNcaaPngUrl(teamId, 500);
-  return json({
-    warning: "LOGO_BMP_BACKEND_BASE not set. Returning PNG URL for testing only.",
-    teamId,
-    png
-  }, 200);
-}
-
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+  // Force Cloudflare edge caching regardless of origin cache headers. [1](https://developers.cloudflare.com/workers/examples/cache-using-fetch/)
+  const res = await fetch(vercelUrl, {
+    cf: { cacheEverything: true, cacheTtl: LOGO_CACHE_TTL_SEC }
   });
+
+  // Pass through as BMP; normalize headers for ESP32 + browser testing
+  return withCors(res, `public, s-maxage=${LOGO_CACHE_TTL_SEC}`);
 }
-``
