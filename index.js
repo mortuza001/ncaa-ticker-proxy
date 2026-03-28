@@ -1,5 +1,5 @@
 /**
- * Sport-agnostic ESPN /scores proxy (NCAA friendly)
+ * Sport-agnostic ESPN /scores proxy 
  *
  * Endpoint:
  *   /scores?preset=cbase&team=UCLA&tz=-4
