@@ -198,6 +198,4 @@ async function handleLogo(url, env, size) {
 
   return withCors(res, `public, s-maxage=${LOGO_CACHE_TTL_SEC}`);
 }
- * - /scores returns compact JSON including home_seo / away_seo
- * - /logo and /logo32 proxy to Vercel BMP backend and cache at Cloudflare edge
- *
+
