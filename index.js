@@ -11,7 +11,7 @@
  *
  *  /logo?teamId=2294&preset=cbase
  *  /logo32?teamId=150&preset=ncaam
- *  /teamlogo?teamId=177&preset=cbase
+ *  /teamlogo?teamId=73&preset=cbase
  */
 
 // ----------------------
@@ -20,9 +20,11 @@
 
 const DEFAULT_VERCEL_BASE = "https://ncaa-proxy.vercel.app";
 
+// Cache settings
 const LOGO_CACHE_TTL_SEC = 7 * 24 * 60 * 60;  // 7 days
 const SCORE_SUBFETCH_TTL_SEC = 15;            // 15s edge cache for ESPN scoreboard fetch
 
+// NCAA presets -> ESPN {sport}/{league}
 const NCAA_PRESETS = {
   cfb:   { sport: "football",   league: "college-football" },
   ncaam: { sport: "basketball", league: "mens-college-basketball" },
@@ -30,6 +32,7 @@ const NCAA_PRESETS = {
   cbase: { sport: "baseball",   league: "college-baseball" }
 };
 
+// If true, show "MM/DD - TBD" instead of just "TBD"
 const SHOW_DATE_FOR_TBD = true;
 
 // ----------------------
@@ -45,22 +48,37 @@ function intOr(val, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/**
+ * Tolerant query getter:
+ * - supports normal keys (preset)
+ * - supports HTML-escaped keys as they appear when someone uses &amp; in the URL (amp;preset)
+ */
+function getQS(url, key) {
+  return (
+    url.searchParams.get(key) ??
+    url.searchParams.get(`amp;${key}`) ?? // handles "...?x=1&amp;preset=cbase"
+    null
+  );
+}
+
 function pickSportLeague(url) {
-  const preset = url.searchParams.get("preset")?.toLowerCase();
-  let sport = url.searchParams.get("sport");
-  let league = url.searchParams.get("league");
+  const preset = (getQS(url, "preset") || "").toLowerCase();
+
+  let sport = getQS(url, "sport");
+  let league = getQS(url, "league");
 
   if (preset && NCAA_PRESETS[preset]) {
     sport = NCAA_PRESETS[preset].sport;
     league = NCAA_PRESETS[preset].league;
   }
 
+  // Default if nothing provided
   if (!sport || !league) {
     sport = "basketball";
     league = "mens-college-basketball";
   }
 
-  return { sport, league };
+  return { sport, league, preset };
 }
 
 function buildScoreboardUrl(sport, league, dates) {
@@ -73,6 +91,7 @@ function formatPreGameTimeSmart(isoDateStr, tzOffsetHours) {
   const d = new Date(isoDateStr);
   if (isNaN(d.getTime())) return "Scheduled";
 
+  // Apply the requested TZ offset
   d.setHours(d.getHours() + tzOffsetHours);
 
   const month = d.getMonth() + 1;
@@ -80,6 +99,7 @@ function formatPreGameTimeSmart(isoDateStr, tzOffsetHours) {
   const hh = d.getHours();
   const mm = d.getMinutes();
 
+  // Midnight placeholder -> TBD
   if (hh === 0 && mm === 0) {
     return SHOW_DATE_FOR_TBD ? `${month}/${day} - TBD` : "TBD";
   }
@@ -97,6 +117,7 @@ function getPreGameClock(event, competition, tzOffsetHours) {
   const detail = status?.type?.detail || "";
   const shortDetail = status?.type?.shortDetail || "";
 
+  // If ESPN explicitly indicates TBD, show TBD
   if (/tbd/i.test(detail) || /tbd/i.test(shortDetail)) {
     const iso = event?.date;
     if (SHOW_DATE_FOR_TBD && iso) {
@@ -143,21 +164,15 @@ function extractGuidFromUrl(u) {
 }
 
 // ----------------------
-// WORKER ROUTES
+// WORKER
 // ----------------------
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/scores") {
-      return handleScores(url);
-    }
-
-    if (url.pathname === "/teamlogo") {
-      return handleTeamLogo(url);
-    }
-
+    if (url.pathname === "/scores") return handleScores(url);
+    if (url.pathname === "/teamlogo") return handleTeamLogo(url);
     if (url.pathname === "/logo" || url.pathname === "/logo32") {
       const size = (url.pathname === "/logo32") ? 32 : 16;
       return handleLogo(url, env, size);
@@ -168,15 +183,15 @@ export default {
 };
 
 // ----------------------
-// /scores  (UNCHANGED OUTPUT)
+// /scores
 // ----------------------
 
 async function handleScores(url) {
   const { sport, league } = pickSportLeague(url);
 
-  const tzOffset = intOr(url.searchParams.get("tz"), -5);
-  const dates = url.searchParams.get("dates");
-  const teamFilter = url.searchParams.get("team")?.toUpperCase();
+  const tzOffset = intOr(getQS(url, "tz"), -5);
+  const dates = getQS(url, "dates"); // optional YYYYMMDD
+  const teamFilter = (getQS(url, "team") || "").toUpperCase();
 
   const espnUrl = buildScoreboardUrl(sport, league, dates);
 
@@ -198,7 +213,7 @@ async function handleScores(url) {
     const games = (data.events || []).map((event) => {
       const competition = event?.competitions?.[0];
       const status = competition?.status ?? event?.status ?? {};
-      const state = status?.type?.state || "pre";
+      const state = status?.type?.state || "pre"; // pre | in | post
 
       if (state === "in") anyActive = true;
       else if (state === "pre") anyUpcoming = true;
@@ -252,13 +267,13 @@ async function handleScores(url) {
 }
 
 // ----------------------
-// /teamlogo (option 1: on-demand ESPN lookup)
+// /teamlogo (on-demand ESPN lookup)
 // ----------------------
 
 async function handleTeamLogo(url) {
-  const teamId = url.searchParams.get("teamId") || url.searchParams.get("id");
-  const preset = url.searchParams.get("preset")?.toLowerCase();
-  const dates = url.searchParams.get("dates"); // optional
+  const teamId = getQS(url, "teamId") || getQS(url, "id");
+  const preset = (getQS(url, "preset") || "").toLowerCase();
+  const dates = getQS(url, "dates"); // optional
 
   if (!teamId || !/^\d+$/.test(teamId)) {
     return json({ error: "Missing or invalid teamId" }, 400);
@@ -267,7 +282,7 @@ async function handleTeamLogo(url) {
     return json({ error: "Missing or invalid preset" }, 400);
   }
 
-  // Edge cache for mapping
+  // Cache mapping result at edge
   const cacheKey = new Request(url.toString(), { method: "GET" });
   const cache = caches.default;
   const cached = await cache.match(cacheKey);
@@ -314,8 +329,11 @@ async function handleTeamLogo(url) {
   }
 
   if (!foundLogoUrl) {
-    // cache misses briefly to avoid repeated ESPN hits
-    const miss = json({ teamId: String(teamId), preset, error: "Logo URL not found in scoreboard" }, 404, "public, s-maxage=600");
+    const miss = json(
+      { teamId: String(teamId), preset, error: "Logo URL not found in scoreboard" },
+      404,
+      "public, s-maxage=600"
+    );
     await cache.put(cacheKey, miss.clone());
     return miss;
   }
@@ -340,15 +358,15 @@ async function handleTeamLogo(url) {
 // ----------------------
 
 async function handleLogo(url, env, size) {
-  const teamId = url.searchParams.get("teamId") || url.searchParams.get("id");
-  const preset = url.searchParams.get("preset")?.toLowerCase(); // optional but recommended
+  const teamId = getQS(url, "teamId") || getQS(url, "id");
+  const preset = (getQS(url, "preset") || "").toLowerCase();
 
   if (!teamId) return new Response("Missing teamId", { status: 400 });
 
   const vercelBase = getVercelBase(env).replace(/\/$/, "");
 
   // 1) First attempt: Python using teamId
-  // Python will do: GitHub -> ESPN teamId
+  // Python does: GitHub -> ESPN teamId
   let vercelUrl = `${vercelBase}/api/logo?teamId=${encodeURIComponent(teamId)}&size=${size}`;
   let res = await fetch(vercelUrl, {
     cf: { cacheEverything: true, cacheTtl: LOGO_CACHE_TTL_SEC }
@@ -358,7 +376,7 @@ async function handleLogo(url, env, size) {
     return withCors(res, `public, s-maxage=${LOGO_CACHE_TTL_SEC}`);
   }
 
-  // 2) If 404 and we have preset, resolve GUID and retry python with logoId
+  // 2) If 404 and preset is present, resolve GUID via /teamlogo and retry python with logoId
   if (res.status === 404 && preset && NCAA_PRESETS[preset]) {
     const mapUrl = new URL(url.toString());
     mapUrl.pathname = "/teamlogo";
@@ -382,6 +400,6 @@ async function handleLogo(url, env, size) {
     }
   }
 
-  // If not ok (or guid mapping failed), pass through original response
+  // Pass through original response (short cache)
   return withCors(res, "public, s-maxage=60");
 }
