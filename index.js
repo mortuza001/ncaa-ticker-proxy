@@ -8,7 +8,7 @@
  *  /scores?preset=cfb&tz=-4
  *  /scores?preset=cbase&tz=-4
  *
- *  /logo?teamId=150
+ *  /logo?teamId=2294
  *  /logo32?teamId=150
  *
  * Cloudflare caching uses fetch cf options cacheEverything/cacheTtl. [1](https://developers.cloudflare.com/workers/examples/cache-using-fetch/)
