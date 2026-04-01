@@ -460,4 +460,5 @@ async function handleLogo(url, env, size) {
     out.headers.set("X-LogoId-Source", logoIdSource);
     out.headers.set("X-Vercel-Url", vercelUrl);
   }
+};
 
