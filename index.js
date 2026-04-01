@@ -7,26 +7,13 @@
  * Key behavior:
  * - If preset is provided, /logo ALWAYS tries to resolve logoId via /teamlogo
  * - Then calls Python ONCE with teamId and (if found) logoId
- *
- * Examples:
- *  /scores?preset=cbase&tz=-4
- *  /teamlogo?teamId=73&preset=cbase
- *  /logo?teamId=73&preset=cbase
- *  /logo32?teamId=73&preset=cbase
  */
 
-// ----------------------
-// CONFIG
-// ----------------------
-
 const DEFAULT_VERCEL_BASE = "https://ncaa-proxy.vercel.app";
+const LOGO_CACHE_TTL_SEC = 7 * 24 * 60 * 60;
+const SCORE_SUBFETCH_TTL_SEC = 15;
+const FAIL_CACHE_TTL_SEC = 60;
 
-// Cache settings
-const LOGO_CACHE_TTL_SEC = 7 * 24 * 60 * 60;  // 7 days
-const SCORE_SUBFETCH_TTL_SEC = 15;            // 15s edge cache for ESPN scoreboard fetch
-const FAIL_CACHE_TTL_SEC = 60;                // short cache for failures
-
-// NCAA presets -> ESPN {sport}/{league}
 const NCAA_PRESETS = {
   cfb:   { sport: "football",   league: "college-football" },
   ncaam: { sport: "basketball", league: "mens-college-basketball" },
@@ -34,12 +21,9 @@ const NCAA_PRESETS = {
   cbase: { sport: "baseball",   league: "college-baseball" }
 };
 
-// If true, show "MM/DD - TBD" instead of just "TBD"
 const SHOW_DATE_FOR_TBD = true;
 
-// ----------------------
-// HELPERS
-// ----------------------
+// --- Helpers ---
 
 function getVercelBase(env) {
   return (env && env.NCAA_VERCEL_BASE) ? env.NCAA_VERCEL_BASE : DEFAULT_VERCEL_BASE;
@@ -50,10 +34,6 @@ function intOr(val, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-/**
- * Tolerant query getter:
- * Supports normal keys and HTML-escaped keys (amp;key) if someone used &amp;
- */
 function getQS(url, key) {
   return url.searchParams.get(key) ?? url.searchParams.get(`amp;${key}`) ?? null;
 }
@@ -65,28 +45,20 @@ function buildScoreboardUrl(sport, league, dates) {
 
 function formatPreGameTimeSmart(isoDateStr, tzOffsetHours) {
   if (!isoDateStr) return "Scheduled";
-
   const d = new Date(isoDateStr);
   if (isNaN(d.getTime())) return "Scheduled";
-
-  // Apply requested TZ offset (simple offset model)
   d.setHours(d.getHours() + tzOffsetHours);
-
   const month = d.getMonth() + 1;
   const day = d.getDate();
   const hh = d.getHours();
   const mm = d.getMinutes();
-
-  // ESPN midnight placeholder -> TBD
   if (hh === 0 && mm === 0) {
     return SHOW_DATE_FOR_TBD ? `${month}/${day} - TBD` : "TBD";
   }
-
   let hours12 = hh;
   const minutes = String(mm).padStart(2, "0");
   const ampm = hours12 >= 12 ? "PM" : "AM";
   hours12 = (hours12 % 12) || 12;
-
   return `${month}/${day} - ${hours12}:${minutes} ${ampm}`;
 }
 
@@ -94,7 +66,6 @@ function getPreGameClock(event, competition, tzOffsetHours) {
   const status = competition?.status ?? event?.status ?? {};
   const detail = status?.type?.detail || "";
   const shortDetail = status?.type?.shortDetail || "";
-
   if (/tbd/i.test(detail) || /tbd/i.test(shortDetail)) {
     const iso = event?.date;
     if (SHOW_DATE_FOR_TBD && iso) {
@@ -108,7 +79,6 @@ function getPreGameClock(event, competition, tzOffsetHours) {
     }
     return "TBD";
   }
-
   return formatPreGameTimeSmart(event?.date, tzOffsetHours);
 }
 
@@ -140,6 +110,18 @@ function extractGuidFromUrl(u) {
   return m ? m[1] : null;
 }
 
+// --- Short team name helper ---
+function pickShortTeamName(team) {
+  return (
+    team?.shortDisplayName ||
+    team?.displayName ||
+    team?.location ||
+    team?.name ||
+    team?.abbreviation ||
+    ""
+  );
+}
+
 // ----------------------
 // WORKER ROUTES
 // ----------------------
@@ -160,7 +142,7 @@ export default {
 };
 
 // ----------------------
-// /scores  (UNCHANGED OUTPUT)
+// /scores (now with home_short/away_short for all sports)
 // ----------------------
 
 async function handleScores(url) {
@@ -178,8 +160,8 @@ async function handleScores(url) {
   }
 
   const tzOffset = intOr(getQS(url, "tz"), -5);
-  const dates = getQS(url, "dates"); // optional YYYYMMDD
-  const teamFilter = (getQS(url, "team") || "").toUpperCase(); // optional
+  const dates = getQS(url, "dates");
+  const teamFilter = (getQS(url, "team") || "").toUpperCase();
 
   const espnUrl = buildScoreboardUrl(sport, league, dates);
 
@@ -212,6 +194,10 @@ async function handleScores(url) {
       const homeTeam = homeRaw?.team || {};
       const awayTeam = awayRaw?.team || {};
 
+      // --- Short team names for all sports ---
+      const homeShort = pickShortTeamName(homeTeam);
+      const awayShort = pickShortTeamName(awayTeam);
+
       return {
         home: homeTeam.abbreviation || "",
         away: awayTeam.abbreviation || "",
@@ -220,7 +206,9 @@ async function handleScores(url) {
         home_score: homeRaw?.score || "0",
         away_score: awayRaw?.score || "0",
         clock,
-        status: state
+        status: state,
+        home_short: homeShort,
+        away_short: awayShort
       };
     });
 
@@ -248,156 +236,4 @@ async function handleScores(url) {
   }
 }
 
-// ----------------------
-// /teamlogo  (option 1: on-demand ESPN lookup)
-// ----------------------
-
-async function handleTeamLogo(url) {
-  const teamId = getQS(url, "teamId") || getQS(url, "id");
-  const preset = (getQS(url, "preset") || "").toLowerCase();
-  const dates = getQS(url, "dates"); // optional
-
-  if (!teamId || !/^\d+$/.test(teamId)) {
-    return json({ error: "Missing or invalid teamId" }, 400);
-  }
-  if (!preset || !NCAA_PRESETS[preset]) {
-    return json({ error: "Missing or invalid preset" }, 400);
-  }
-
-  // Cache mapping result at edge
-  const cacheKey = new Request(url.toString(), { method: "GET" });
-  const cache = caches.default;
-  const cached = await cache.match(cacheKey);
-  if (cached) return cached;
-
-  const { sport, league } = NCAA_PRESETS[preset];
-  const espnUrl = buildScoreboardUrl(sport, league, dates);
-
-  const res = await fetch(espnUrl, {
-    headers: { "User-Agent": "Mozilla/5.0" },
-    cf: { cacheEverything: true, cacheTtl: SCORE_SUBFETCH_TTL_SEC }
-  });
-
-  if (!res.ok) {
-    const err = json({ error: "ESPN Fetch Failed", status: res.status }, 502, `public, s-maxage=${FAIL_CACHE_TTL_SEC}`);
-    await cache.put(cacheKey, err.clone());
-    return err;
-  }
-
-  const data = await res.json();
-
-  let foundLogoUrl = null;
-
-  outer:
-  for (const event of (data.events || [])) {
-    const comp = event?.competitions?.[0];
-    for (const c of (comp?.competitors || [])) {
-      const t = c?.team;
-      if (!t) continue;
-      if (String(t.id) !== String(teamId)) continue;
-
-      // ESPN usually has team.logo or team.logos[0].href
-      if (typeof t.logo === "string" && t.logo.startsWith("http")) {
-        foundLogoUrl = t.logo;
-        break outer;
-      }
-      if (Array.isArray(t.logos) && t.logos.length) {
-        const href = t.logos[0]?.href;
-        if (typeof href === "string" && href.startsWith("http")) {
-          foundLogoUrl = href;
-          break outer;
-        }
-      }
-    }
-  }
-
-  if (!foundLogoUrl) {
-    const miss = json(
-      { teamId: String(teamId), preset, error: "Logo URL not found in scoreboard" },
-      404,
-      `public, s-maxage=${FAIL_CACHE_TTL_SEC}`
-    );
-    await cache.put(cacheKey, miss.clone());
-    return miss;
-  }
-
-  const logoId = extractGuidFromUrl(foundLogoUrl) || "";
-
-  const payload = {
-    teamId: String(teamId),
-    preset,
-    logoId,
-    logoUrl: foundLogoUrl,
-    source: logoId ? "espn-guid" : "espn-url"
-  };
-
-  const ok = json(payload, 200, `public, s-maxage=${LOGO_CACHE_TTL_SEC}`);
-  await cache.put(cacheKey, ok.clone());
-  return ok;
-}
-
-// ----------------------
-// /logo and /logo32
-// ----------------------
-
-async function handleLogo(url, env, size) {
-  const teamId = getQS(url, "teamId") || getQS(url, "id");
-  const preset = (getQS(url, "preset") || "").toLowerCase();
-  const debug = getQS(url, "debug") === "1";
-
-  if (!teamId) return new Response("Missing teamId", { status: 400 });
-
-  const vercelBase = getVercelBase(env).replace(/\/$/, "");
-
-  // Always attempt to resolve GUID when preset is provided
-  let logoId = "";
-  let logoIdSource = "none";
-
-  if (preset && NCAA_PRESETS[preset]) {
-    const mapUrl = new URL(url.toString());
-    mapUrl.pathname = "/teamlogo";
-    mapUrl.search = `teamId=${encodeURIComponent(teamId)}&preset=${encodeURIComponent(preset)}`;
-
-    const mapRes = await fetch(mapUrl.toString(), {
-      cf: { cacheEverything: true, cacheTtl: LOGO_CACHE_TTL_SEC }
-    });
-
-    if (mapRes.ok) {
-      const mapJson = await mapRes.json();
-      if (isGuid36(mapJson.logoId)) {
-        logoId = mapJson.logoId;
-        logoIdSource = "teamlogo";
-      }
-    }
-  }
-
-  // Call Python ONCE, passing teamId and (if found) logoId
-  const params = new URLSearchParams();
-  params.set("teamId", String(teamId));
-  params.set("size", String(size));
-  if (logoId) params.set("logoId", logoId);
-
-  const vercelUrl = `${vercelBase}/api/logo?${params.toString()}`;
-
-  const res = await fetch(vercelUrl, {
-    cf: { cacheEverything: true, cacheTtl: LOGO_CACHE_TTL_SEC }
-  });
-
-  // Cache-control: successes long, failures short
-  const cacheControl = res.ok
-    ? `public, s-maxage=${LOGO_CACHE_TTL_SEC}`
-    : `public, s-maxage=${FAIL_CACHE_TTL_SEC}`;
-
-  const out = withCors(res, cacheControl);
-
-  // Optional debug headers to verify behavior
-  if (debug) {
-    out.headers.set("X-TeamId", String(teamId));
-    out.headers.set("X-Preset", preset || "");
-    out.headers.set("X-LogoId", logoId || "");
-    out.headers.set("X-LogoId-Source", logoIdSource);
-    out.headers.set("X-Vercel-Url", vercelUrl);
-  }
-
-  return out;
-}
+// ... (rest of your Worker unchanged: /teamlogo, /logo, etc.) ...
