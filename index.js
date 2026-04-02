@@ -210,38 +210,67 @@ async function handleTeamLogo(url) {
 // ---------------- /logo ----------------
 
 async function handleLogo(url, env, size) {
-  const logoIdParam = getQS(url, "logoId");
-  const teamId = getQS(url, "teamId");
+  const teamId = getQS(url, "teamId") || getQS(url, "id");
   const preset = (getQS(url, "preset") || "").toLowerCase();
+  const debug = getQS(url, "debug") === "1";
 
+  const logoIdParam = getQS(url, "logoId");
   let logoId = isGuid36(logoIdParam) ? logoIdParam : "";
+  let logoIdSource = logoId ? "query" : "none";
 
-  // Resolve GUID ONLY if missing
-  if (!logoId && teamId && NCAA_PRESETS[preset]) {
+  // If neither logoId nor teamId is present, fail fast
+  if (!logoId && !teamId) {
+    return new Response("Missing logoId or teamId", { status: 400 });
+  }
+
+  const vercelBase = getVercelBase(env).replace(/\/$/, "");
+
+  // Resolve GUID only if missing and we have teamId+preset
+  if (!logoId && teamId && preset && NCAA_PRESETS[preset]) {
     const mapUrl = new URL(url.toString());
     mapUrl.pathname = "/teamlogo";
-    mapUrl.search = `teamId=${teamId}&preset=${preset}`;
-    const mapRes = await fetch(mapUrl);
+    mapUrl.search = `teamId=${encodeURIComponent(teamId)}&preset=${encodeURIComponent(preset)}`;
+
+    const mapRes = await fetch(mapUrl.toString(), {
+      cf: { cacheEverything: true, cacheTtl: LOGO_CACHE_TTL_SEC }
+    });
+
     if (mapRes.ok) {
-      const j = await mapRes.json();
-      if (isGuid36(j.logoId)) logoId = j.logoId;
+      const mapJson = await mapRes.json();
+      if (isGuid36(mapJson.logoId)) {
+        logoId = mapJson.logoId;
+        logoIdSource = "teamlogo";
+      }
     }
   }
 
-  const params = new URLSearchParams({ size: String(size) });
+  // Call Python ONCE:
+  // - Prefer logoId when available
+  // - Fallback to teamId only if logoId still missing
+  const params = new URLSearchParams();
+  params.set("size", String(size));
   if (logoId) params.set("logoId", logoId);
-  else params.set("teamId", teamId || "");
+  else params.set("teamId", String(teamId));
 
-  const vercelUrl = `${getVercelBase(env)}/api/logo?${params.toString()}`;
+  const vercelUrl = `${vercelBase}/api/logo?${params.toString()}`;
 
   const res = await fetch(vercelUrl, {
     cf: { cacheEverything: true, cacheTtl: LOGO_CACHE_TTL_SEC }
   });
 
-  return withCors(
-    res,
-    res.ok
-      ? `public, s-maxage=${LOGO_CACHE_TTL_SEC}`
-      : `public, s-maxage=${FAIL_CACHE_TTL_SEC}`
-  );
+  const cacheControl = res.ok
+    ? `public, s-maxage=${LOGO_CACHE_TTL_SEC}`
+    : `public, s-maxage=${FAIL_CACHE_TTL_SEC}`;
+
+  const out = withCors(res, cacheControl);
+
+  if (debug) {
+    out.headers.set("X-TeamId", String(teamId || ""));
+    out.headers.set("X-Preset", preset || "");
+    out.headers.set("X-LogoId", logoId || "");
+    out.headers.set("X-LogoId-Source", logoIdSource);
+    out.headers.set("X-Vercel-Url", vercelUrl);
+  }
+
+  return out;
 }
