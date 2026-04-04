@@ -28,6 +28,14 @@ const SHOW_DATE_FOR_TBD = true;
 
 // ---------------- HELPERS ----------------
 
+function isTbdClock(detail) {
+  if (!detail || typeof detail !== "string") return false;
+  const s = detail.toUpperCase();
+  // ESPN variants we commonly see for unknown start time
+  return s.includes("TBD") || s.includes("TBA");
+}
+
+
 function getVercelBase(env) {
   return (env && env.NCAA_VERCEL_BASE) ? env.NCAA_VERCEL_BASE : DEFAULT_VERCEL_BASE;
 }
@@ -191,11 +199,17 @@ async function handleScores(url) {
     // Default clock (live/in-game detail)
     let clock = detail;
 
-    // If upcoming, format clock as "4 Apr, 9:00 PM" using tz offset hours
-    if (status === "pre" && startIsoUtc) {
+   
+    // ✅ If ESPN says TBD/TBA, keep it exactly as is
+    if (status === "pre" && isTbdClock(detail)) {
+      clock = detail;
+    }
+    // ✅ Otherwise, for upcoming games with a real timestamp, format using tz
+    else if (status === "pre" && startIsoUtc) {
       const pretty = formatLocalFromUtcIso_DDMon_Time(startIsoUtc, tzOffset);
       if (pretty) clock = pretty;
     }
+
 
     return {
       home: homeTeam.abbreviation || "",
