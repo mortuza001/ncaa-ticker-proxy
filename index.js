@@ -169,7 +169,6 @@ async function handleScores(url) {
     league = "mens-college-basketball";
   }
 
-  // tz is expected as HOURS offset (e.g., -4)
   const tzOffset = intOr(getQS(url, "tz"), -5);
   const dates = getQS(url, "dates");
 
@@ -183,57 +182,61 @@ async function handleScores(url) {
 
   const data = await res.json();
 
+  let anyActive = false;
+  let anyUpcoming = false;
+
   const games = (data.events || []).map(e => {
     const c = e?.competitions?.[0];
+    const status = c?.status || {};
+    const statusState = status?.type?.state || "unknown";
+
+    if (statusState === "in") anyActive = true;
+    else if (statusState === "pre") anyUpcoming = true;
+
+    let displayClock = status?.displayClock || "";
+
+    if (statusState === "pre") {
+      const isoUtc = c?.date || e?.date;
+      if (isoUtc) {
+        displayClock = formatLocalFromUtcIso_DDMon_Time(isoUtc, tzOffset);
+      }
+    }
+
     const homeRaw = c?.competitors?.find(x => x.homeAway === "home");
     const awayRaw = c?.competitors?.find(x => x.homeAway === "away");
-    const homeTeam = homeRaw?.team || {};
-    const awayTeam = awayRaw?.team || {};
-
-    const status = c?.status?.type?.state || "pre";
-    const detail = c?.status?.type?.detail || "";
-
-    // Prefer ESPN event ISO date for upcoming formatting
-    const startIsoUtc = e?.date || c?.date || "";
-
-    // Default clock (live/in-game detail)
-    let clock = detail;
-
-   
-    // ✅ If ESPN says TBD/TBA, keep it exactly as is
-    if (status === "pre" && isTbdClock(detail)) {
-      clock = detail;
-    }
-    // ✅ Otherwise, for upcoming games with a real timestamp, format using tz
-    else if (status === "pre" && startIsoUtc) {
-      const pretty = formatLocalFromUtcIso_DDMon_Time(startIsoUtc, tzOffset);
-      if (pretty) clock = pretty;
-    }
-
 
     return {
-      away: homeTeam.abbreviation || "",
-      home: awayTeam.abbreviation || "",
-      away_id: String(homeTeam.id || ""),
-      home_id: String(awayTeam.id || ""),
-
-      // ✅ PRIMARY (GUID)
-      away_logoId: extractLogoIdFromTeam(homeTeam),
-      home_logoId: extractLogoIdFromTeam(awayTeam),
-
-      away_short: pickShortTeamName(homeTeam),
-      home_short: pickShortTeamName(awayTeam),
-
-      away_score: homeRaw?.score || "0",
+      home: normalizeCode(awayRaw?.team?.abbreviation || ""),
+      away: normalizeCode(homeRaw?.team?.abbreviation || ""),
       home_score: awayRaw?.score || "0",
-
-      clock,
-      status
+      away_score: homeRaw?.score || "0",
+      clock: displayClock,
+      period: String(status?.period || ""),
+      status: statusState
     };
   });
 
-  return json(games, 200, "public, s-maxage=10");
+  // Smart polling only affects headers, not JSON output
+  let pollInterval = 10;
+  let swr = 10;
+
+  if (!anyActive && anyUpcoming) {
+    pollInterval = 600;
+    swr = 60;
+  }
+
+  if (!anyActive && !anyUpcoming) {
+    pollInterval = 7200;
+    swr = 300;
+  }
+
+  return json(
+    games,
+    200,
+    `public, s-maxage=${pollInterval}, stale-while-revalidate=${swr}`
+  );
 }
+
 
 // ---------------- /teamlogo ----------------
 
