@@ -216,7 +216,7 @@ async function handleScores(url) {
       period: String(status?.period || ""),
       clock: displayClock,
 
-      home: {
+      away: {
         teamId: homeTeam?.id || "",
         name: pickShortTeamName(homeTeam),
         abbreviation: homeTeam?.abbreviation || "",
@@ -224,7 +224,7 @@ async function handleScores(url) {
         logoId: extractLogoIdFromTeam(homeTeam)
       },
 
-      away: {
+      home: {
         teamId: awayTeam?.id || "",
         name: pickShortTeamName(awayTeam),
         abbreviation: awayTeam?.abbreviation || "",
