@@ -232,28 +232,7 @@ async function handleScores(url) {
     };
   });
 
- 
-    // Smart polling
-  let pollInterval = 10;   // live games
-  let swr = 10;
-
-  if (!anyActive && anyUpcoming) {
-    pollInterval = 600;    // 10 minutes
-    swr = 60;
-  }
-
-  if (!anyActive && !anyUpcoming) {
-    pollInterval = 7200;   // 2 hours
-    swr = 300;
-  }
-
-  return json(
-    games,
-    200,
-    `public, s-maxage=${pollInterval}, stale-while-revalidate=${swr}`
-  );
-   
-
+  return json(games, 200, "public, s-maxage=10");
 }
 
 // ---------------- /teamlogo ----------------
