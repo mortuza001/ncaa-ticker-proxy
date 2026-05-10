@@ -148,8 +148,8 @@ export default {
 
     if (url.pathname === "/scores") return handleScores(url);
     if (url.pathname === "/teamlogo") return handleTeamLogo(url);
-    if (url.pathname === "/logo" || url.pathname === "/logo32") {
-      const size = url.pathname === "/logo32" ? 32 : 16;
+    if (url.pathname === "/logo" || url.pathname === "/logo32" || url.pathname === "/logo24") {
+      const size = url.pathname === "/logo32" ? 32 : (url.pathname === "/logo24" ? 24 : 16);
       return handleLogo(url, env, size);
     }
 
