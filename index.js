@@ -21,7 +21,8 @@ const NCAA_PRESETS = {
   cfb:   { sport: "football",   league: "college-football" },
   ncaam: { sport: "basketball", league: "mens-college-basketball" },
   ncaaw: { sport: "basketball", league: "womens-college-basketball" },
-  cbase: { sport: "baseball",   league: "college-baseball" }
+  cbase: { sport: "baseball",   league: "college-baseball" },
+  fifa:  { sport: "soccer",     league: "fifa.world" }
 };
 
 const SHOW_DATE_FOR_TBD = true;
