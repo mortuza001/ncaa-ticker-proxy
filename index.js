@@ -51,7 +51,7 @@ function getQS(url, key) {
 }
 
 function buildScoreboardUrl(sport, league, dates) {
-  const base = `https://site.api.espn.com/apis/site/v2/sports/${sport}/${league}/scoreboard`;
+  const base = `https://site.web.api.espn.com/apis/site/v2/sports/${sport}/${league}/scoreboard`;
   return dates ? `${base}?dates=${encodeURIComponent(dates)}` : base;
 }
 
